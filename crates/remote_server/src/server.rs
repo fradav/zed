@@ -977,6 +977,7 @@ pub(crate) fn execute_proxy(
         log::error!("encountered error while forwarding messages: {forwarding_result:#}",);
         if !matches!(gpui::block_on(check_server_running(server_pid)), Ok(true)) {
             log::error!("server exited unexpectedly");
+            dump_server_log_tail(&server_paths.log_file).log_err();
             return Err(ExecuteProxyError::ServerNotRunning(
                 ProxyLaunchError::ServerNotRunning,
             ));
@@ -984,6 +985,24 @@ pub(crate) fn execute_proxy(
         return Err(forwarding_result);
     }
 
+    Ok(())
+}
+
+// The server's own stdout/stderr are nulled (it talks to the proxy only over Unix
+// sockets), so when it crashes the proxy sees nothing but the fd EOF. Any panic lands
+// in the server's rotating log file; dump its tail to the proxy's stderr so the cause
+// actually reaches the local client's log instead of a bare "server exited unexpectedly".
+fn dump_server_log_tail(log_file: &Path) -> Result<()> {
+    let contents = std::fs::read_to_string(log_file)
+        .with_context(|| format!("failed to read server log at {}", log_file.display()))?;
+    let mut tail: Vec<_> = contents.lines().rev().take(80).collect();
+    tail.reverse();
+    eprintln!(
+        "Server exited unexpectedly. Last {} lines of {}:\n{}",
+        tail.len(),
+        log_file.display(),
+        tail.join("\n")
+    );
     Ok(())
 }
 
