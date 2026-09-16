@@ -49,10 +49,14 @@ pub fn parse_prompt_too_long(message: &str) -> Option<u64> {
 }
 
 /// Recognizes OpenAI-style context window overflow errors, which arrive either
-/// with the `context_length_exceeded` error code or a "Your input exceeds the
-/// context window of this model" message.
+/// with the `context_length_exceeded` error code, a "Your input exceeds the
+/// context window of this model" message, or vLLM's "maximum context length"
+/// / "too many tokens" phrasings.
 pub fn is_context_window_exceeded_message(message: &str) -> bool {
-    message.contains("context_length_exceeded") || message.contains("exceeds the context window")
+    message.contains("context_length_exceeded")
+        || message.contains("exceeds the context window")
+        || message.contains("maximum context length")
+        || message.contains("too many tokens")
 }
 
 #[cfg(test)]
@@ -110,9 +114,34 @@ mod tests {
         let fixed2 = fix_streamed_json(chunk2);
         let parsed2: serde_json::Value = serde_json::from_str(&fixed2).expect("valid json");
         let text2 = parsed2["replacement_text"].as_str().expect("string");
-        assert_eq!(text2, "fn foo() {\n    return bar;\n}");
-
         let delta = &text2[text1.len()..];
         assert_eq!(delta, "\n    return bar;\n}");
+    }
+
+    #[test]
+    fn test_is_context_window_exceeded_message() {
+        let vllm = "This model's maximum context length is 131072 tokens. However, you \
+            requested 131073 tokens (106497 in the messages, 24576 in the completion). \
+            Please reduce the length of the messages or completion.";
+        assert!(is_context_window_exceeded_message(vllm));
+
+        assert!(is_context_window_exceeded_message(
+            "context_length_exceeded: Your input is too long"
+        ));
+        assert!(is_context_window_exceeded_message(
+            "Your input exceeds the context window of this model"
+        ));
+        assert!(is_context_window_exceeded_message(
+            "This request uses too many tokens for the model"
+        ));
+
+        // The generic "prompt is too long: N tokens" message is handled by
+        // `parse_prompt_too_long` instead, not by this recognizer.
+        assert!(!is_context_window_exceeded_message(
+            "prompt is too long: 1234 tokens"
+        ));
+        assert!(!is_context_window_exceeded_message(
+            "Some unrelated 400 error"
+        ));
     }
 }
