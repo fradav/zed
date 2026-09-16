@@ -460,6 +460,7 @@ pub fn into_open_router(
     model: &Model,
     max_output_tokens: Option<u64>,
 ) -> Result<open_router::Request> {
+    let max_output_tokens = request.effective_max_output_tokens(max_output_tokens);
     if request.contains_custom_tool_input() {
         anyhow::bail!("OpenRouter does not support custom tools");
     }
@@ -792,8 +793,9 @@ mod tests {
             None,
         );
         let thread_id = "internal-thread-id";
-        let request = LanguageModelRequest {
+        let request = |max_output_tokens| LanguageModelRequest {
             thread_id: Some(thread_id.to_string()),
+            max_output_tokens,
             messages: vec![language_model::LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec![MessageContent::Text("Hello".to_string())],
@@ -803,17 +805,27 @@ mod tests {
             ..Default::default()
         };
 
-        let result = into_open_router(request, &model, None).unwrap();
-
-        assert_eq!(
-            result.session_id,
-            open_router_session_id(Some(thread_id.into()))
-        );
-        assert_ne!(result.session_id.as_deref(), Some(thread_id));
-        assert_ne!(
-            result.session_id,
-            open_router_session_id(Some("another-thread-id".into()))
-        );
+        for (requested, maximum, expected) in [
+            (None, None, None),
+            (None, Some(4096), Some(4096)),
+            (Some(1024), Some(4096), Some(1024)),
+            (Some(8192), Some(4096), Some(4096)),
+        ] {
+            let result = into_open_router(request(requested), &model, maximum).unwrap();
+            assert_eq!(
+                result.session_id,
+                open_router_session_id(Some(thread_id.into()))
+            );
+            assert_ne!(result.session_id.as_deref(), Some(thread_id));
+            assert_ne!(
+                result.session_id,
+                open_router_session_id(Some("another-thread-id".into()))
+            );
+            assert_eq!(
+                serde_json::to_value(result).unwrap()["max_tokens"].as_u64(),
+                expected
+            );
+        }
     }
 
     #[gpui::test]
