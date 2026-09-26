@@ -4596,7 +4596,7 @@ impl Thread {
     /// Budget the summary against the measured input and leave at least half of
     /// the remaining window free as headroom for prompt growth, capped at the
     /// model's default output budget.
-    fn compaction_max_output_tokens(&self, model: &Arc<dyn LanguageModel>) -> Option<u64> {
+    fn compaction_max_output_tokens(&self, model: &LanguageModel) -> Option<u64> {
         let max_token_count = model.max_token_count();
         let default_output = model.max_output_tokens();
         let Some(mut input_tokens) = self.latest_request_token_usage().map(total_input_tokens)
@@ -7503,12 +7503,10 @@ mod tests {
 
     #[gpui::test]
     async fn test_compaction_max_output_tokens_clamps_to_context_window(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let fake_model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
         // A small default caps the budget, but the clamp must never let
         // input + budget exceed the model's context window.
-        fake_model.set_max_output_tokens(Some(32_000));
-        let model: Arc<dyn LanguageModel> = fake_model;
+        let model = fake.update_model("fake", |model| model.max_output_tokens = Some(32_000));
         let user_message_id = ClientUserMessageId::new();
 
         cx.update(|cx| {
@@ -7559,8 +7557,8 @@ mod tests {
 
                 // Even without a model-provided default, the budget stays within
                 // the window.
-                let fake_model_without_default = Arc::new(FakeLanguageModel::default());
-                let model_without_default: Arc<dyn LanguageModel> = fake_model_without_default;
+                let model_without_default =
+                    fake.update_model("fake", |model| model.max_output_tokens = None);
                 thread.set_model(model_without_default.clone(), cx);
                 let budget = thread
                     .compaction_max_output_tokens(&model_without_default)
