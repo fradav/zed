@@ -4,7 +4,12 @@ set -euo pipefail
 source script/lib/blob-store.sh
 
 build_flag="--release"
-zed_features=""
+# Keep the dev-only remote-server escape hatch (ZED_COPY_REMOTE_SERVER /
+# ZED_BUILD_REMOTE_SERVER) compiled into the bundled app; it is otherwise
+# gated behind debug_assertions and the dev-channel release bundle cannot
+# provision a remote server binary (no download source exists for the dev
+# channel).
+zed_features="--features remote/build-remote-server-binary"
 remote_server_features=""
 target_dir="release"
 open_result=false
@@ -246,6 +251,10 @@ function sign_app_binaries() {
             echo "Created application bundle:"
             echo "$app_path"
         fi
+    elif [ "$local_install" = true ]; then
+        # The app was already moved to /Applications above; do not try to
+        # move it again into the DMG staging dir.
+        echo "Local install detected - skipping DMG creation and signing"
     else
         dmg_target_directory="target/${target_triple}/${target_dir}"
         dmg_source_directory="${dmg_target_directory}/dmg"
@@ -356,5 +365,5 @@ cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+sign_binary "target/$target_triple/${target_dir}/remote_server"
+gzip -f --stdout --best target/$target_triple/${target_dir}/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
