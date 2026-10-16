@@ -268,15 +268,52 @@ async fn build_remote_server_from_source(
     use std::env::VarError;
     use util::command::{Command, Stdio, new_command};
 
-    if let Ok(path) = std::env::var("ZED_COPY_REMOTE_SERVER") {
-        let path = std::path::PathBuf::from(path);
-        if path.exists() {
-            return Ok(Some(path));
-        } else {
-            log::warn!(
-                "ZED_COPY_REMOTE_SERVER path does not exist, falling back to ZED_BUILD_REMOTE_SERVER: {}",
-                path.display()
+    // Opt-in bandwidth saver: a usable server binary already on the remote is
+    // reused instead of being re-uploaded on every connection.
+    if binary_exists_on_server
+        && std::env::var("ZED_REUSE_REMOTE_SERVER")
+            .is_ok_and(|value| value == "true" || value == "1")
+    {
+        log::info!(
+            "ZED_REUSE_REMOTE_SERVER is set and a server binary is already usable, reusing it"
+        );
+        return Ok(None);
+    }
+
+    if let Ok(copy) = std::env::var("ZED_COPY_REMOTE_SERVER") {
+        let copy = std::path::PathBuf::from(copy.as_str());
+        // A directory value lets one variable cover several remote platforms:
+        // the first `remote_server-<os>-<arch>` /
+        // `zed-remote-server-<os>-<arch>` file (bare or `.gz`) found inside
+        // it is used, keyed on the platform detected before provisioning.
+        let candidates = if copy.is_dir() {
+            let stem = format!(
+                "remote_server-{}-{}",
+                platform.os.as_str(),
+                platform.arch.as_str()
             );
+            let bundle_stem = format!(
+                "zed-remote-server-{}-{}",
+                platform.os.as_str(),
+                platform.arch.as_str()
+            );
+            vec![
+                copy.join(format!("{stem}.gz")),
+                copy.join(&stem),
+                copy.join(format!("{bundle_stem}.gz")),
+                copy.join(&bundle_stem),
+            ]
+        } else {
+            vec![copy.clone()]
+        };
+        match candidates.iter().find(|candidate| candidate.is_file()) {
+            Some(path) => return Ok(Some(path.clone())),
+            None => {
+                log::warn!(
+                    "ZED_COPY_REMOTE_SERVER path does not exist, falling back to ZED_BUILD_REMOTE_SERVER: {}",
+                    copy.display()
+                );
+            }
         }
     }
 
