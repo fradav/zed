@@ -4602,6 +4602,61 @@ async fn test_tool_updates_to_completion(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_oversized_tool_output_replaced_with_notice(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    thread.update(cx, |thread, _cx| thread.add_tool(EchoTool));
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Echo a huge output"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // The tool output exceeds TOOL_OUTPUT_BYTE_BUDGET, so the model should only
+    // see a short notice while the full text is preserved in the raw output.
+    let huge_output = "x".repeat(50_000);
+    let input = json!({ "text": huge_output });
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "1".into(),
+            name: EchoTool::NAME.into(),
+            raw_input: input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let completion = fake.pending_completions().pop().unwrap();
+    let message = completion.messages.last().unwrap();
+    assert_eq!(
+        message.content,
+        vec![language_model::MessageContent::ToolResult(
+            LanguageModelToolResult {
+                tool_use_id: "1".into(),
+                tool_name: EchoTool::NAME.into(),
+                is_error: false,
+                content: vec![language_model::LanguageModelToolResultContent::Text(
+                    Arc::from(
+                        "[Tool output too large (50000 bytes) to include in the model request; see the transcript for the full output]"
+                    )
+                )],
+                output: Some(serde_json::json!(huge_output)),
+            }
+        )]
+    );
+}
+
+#[gpui::test]
 async fn test_send_no_retry_on_success(cx: &mut TestAppContext) {
     let ThreadTest {
         model,

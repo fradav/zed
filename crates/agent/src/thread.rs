@@ -126,6 +126,12 @@ pub const MIN_COMPACTION_CONTEXT_WINDOW: u64 = 80_000;
 // Using the heuristic that 1 token is about 4 bytes, keep the last 80K bytes of user-message content (~20k tokens).
 const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 
+/// Tool results larger than this many bytes are not sent to the model in full.
+/// The model sees a short notice instead; the complete output is still kept on
+/// the result so the transcript shows the whole thing. Under the heuristic that
+/// 1 token is about 4 bytes, this is roughly 10k tokens.
+const TOOL_OUTPUT_BYTE_BUDGET: usize = 40_000;
+
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
 pub struct NoModelConfiguredError;
@@ -3956,6 +3962,31 @@ impl Thread {
                     }
                 }
                 Err(output) => (true, output),
+            };
+
+            // Cap oversized tool outputs before they reach the model's context
+            // window. The raw output is preserved on the result so the
+            // transcript still contains the full text, but the model only sees
+            // a short notice pointing at it.
+            let tool_output_size = output
+                .llm_output
+                .iter()
+                .map(|part| match part {
+                    LanguageModelToolResultContent::Text(text) => text.len(),
+                    LanguageModelToolResultContent::Image(image) => image.len(),
+                })
+                .sum::<usize>();
+            let output = if tool_output_size > TOOL_OUTPUT_BYTE_BUDGET {
+                AgentToolOutput {
+                    llm_output: vec![LanguageModelToolResultContent::Text(Arc::from(
+                        format!(
+                            "[Tool output too large ({tool_output_size} bytes) to include in the model request; see the transcript for the full output]"
+                        ),
+                    ))],
+                    raw_output: output.raw_output,
+                }
+            } else {
+                output
             };
 
             (
