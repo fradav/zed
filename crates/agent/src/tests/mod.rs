@@ -4312,6 +4312,88 @@ async fn test_stream_thread_title_stops_when_newline_ends_chunk(cx: &mut TestApp
     assert_eq!(title, "Hello world");
 }
 
+#[gpui::test]
+async fn test_stream_thread_title_skips_leading_whitespace(cx: &mut TestAppContext) {
+    let request = LanguageModelRequest::default();
+    let fake = cx.update(LanguageModelRegistry::test);
+    let registered_model = fake.model("fake");
+
+    let title_task = cx.spawn({
+        let registered_model = registered_model.clone();
+        async move |cx| crate::stream_thread_title(registered_model, request, &cx).await
+    });
+
+    cx.run_until_parked();
+
+    fake.send_last_text(&registered_model, "\n\n");
+    fake.send_last_text(&registered_model, "Fix Rust build\nGoodnight Moon");
+    fake.end_last(&registered_model);
+
+    let title = title_task.await.unwrap();
+    assert_eq!(title, "Fix Rust build");
+}
+
+#[gpui::test]
+async fn test_stream_thread_title_errors_on_empty_output(cx: &mut TestAppContext) {
+    let request = LanguageModelRequest::default();
+    let fake = cx.update(LanguageModelRegistry::test);
+    let registered_model = fake.model("fake");
+
+    let title_task = cx.spawn({
+        let registered_model = registered_model.clone();
+        async move |cx| crate::stream_thread_title(registered_model, request, &cx).await
+    });
+
+    cx.run_until_parked();
+
+    fake.send_last_text(&registered_model, "\n\n \n");
+    fake.end_last(&registered_model);
+
+    let error = title_task.await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("empty"),
+        "expected an empty-title error, got {error:#}"
+    );
+}
+
+#[gpui::test]
+async fn test_thread_title_generation_surfaces_empty_output(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    let summary_model = fake.model("summary");
+    thread.update(cx, |thread, cx| {
+        thread.set_summarization_model(Some(summary_model.clone()), cx)
+    });
+
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake.send_last_text(&model, "Hey!");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let summary_request = fake.pending_completions_for(&summary_model).pop().unwrap();
+    fake.send_text(&summary_model, &summary_request, "\n\n");
+    fake.end_stream(&summary_model, &summary_request);
+    send.collect::<Vec<_>>().await;
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.title(), None);
+        assert!(thread.has_failed_title_generation());
+        assert!(!thread.is_generating_title());
+    });
+}
+
 // `Thread::to_markdown` (live native) and `DbThread::to_markdown` (persisted
 // native) must stay byte-for-byte identical for the same messages, since both
 // back the sidebar's native "Open Thread as Markdown" action. This pins that

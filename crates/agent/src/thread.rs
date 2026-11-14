@@ -4214,7 +4214,14 @@ impl Thread {
                         _ => continue,
                     };
 
-                    let mut lines = text.lines();
+                    // Leading newlines (e.g. the separator left after a
+                    // stripped thinking block) would make the first line
+                    // empty and drop the chunk's content.
+                    let mut chunk = text.as_str();
+                    if summary.is_empty() {
+                        chunk = chunk.trim_start_matches([' ', '\t', '\n', '\r']);
+                    }
+                    let mut lines = chunk.lines();
                     summary.extend(lines.next());
                 }
 
@@ -5435,12 +5442,24 @@ pub async fn stream_thread_title(
         let LanguageModelCompletionEvent::Text(text) = event? else {
             continue;
         };
-        if let Some(newline_ix) = text.find(|ch| ch == '\n' || ch == '\r') {
-            title.push_str(&text[..newline_ix]);
+        // Backends that strip a thinking block server-side can emit the
+        // separator newlines as the first chunks; stopping there would store
+        // an empty title, so skip leading whitespace until real text arrives.
+        let mut chunk = text.as_str();
+        if title.is_empty() {
+            chunk = chunk.trim_start_matches([' ', '\t', '\n', '\r']);
+            if chunk.is_empty() {
+                continue;
+            }
+        }
+        if let Some(newline_ix) = chunk.find(['\n', '\r']) {
+            title.push_str(&chunk[..newline_ix]);
             break;
         }
-        title.push_str(&text);
+        title.push_str(chunk);
     }
+    let title = title.trim_end().to_string();
+    anyhow::ensure!(!title.is_empty(), "model returned an empty thread title");
     Ok(title)
 }
 
