@@ -434,7 +434,7 @@ pub(crate) fn parse_markdown_with_options(
                             language_paths.insert(path_range.path.clone());
                             CodeBlockKind::FencedSrc(path_range)
                         } else {
-                            let language = SharedString::from(info.to_string());
+                            let language = SharedString::from(info);
                             language_names.insert(language.clone());
                             CodeBlockKind::FencedLang(language)
                         };
@@ -682,7 +682,7 @@ pub(crate) fn parse_markdown_with_options(
                             link_range.clone(),
                             MarkdownEvent::Start(MarkdownTag::Link {
                                 link_type: LinkType::Autolink,
-                                dest_url: SharedString::from(link.as_str().to_string()),
+                                dest_url: SharedString::from(link.as_str()),
                                 title: SharedString::default(),
                                 id: SharedString::default(),
                             }),
@@ -806,7 +806,7 @@ pub fn parse_links_only(text: &str) -> Vec<(Range<usize>, MarkdownEvent)> {
             link_range.clone(),
             MarkdownEvent::Start(MarkdownTag::Link {
                 link_type: LinkType::Autolink,
-                dest_url: SharedString::from(link.as_str().to_string()),
+                dest_url: SharedString::from(link.as_str()),
                 title: SharedString::default(),
                 id: SharedString::default(),
             }),
