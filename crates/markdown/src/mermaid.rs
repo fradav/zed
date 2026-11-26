@@ -1829,7 +1829,7 @@ mod tests {
                 None,
                 None,
                 MarkdownOptions {
-                    render_mermaid_diagrams: true,
+                    render_embedded_diagrams: true,
                     defer_parsing: true,
                     ..MarkdownOptions::default()
                 },

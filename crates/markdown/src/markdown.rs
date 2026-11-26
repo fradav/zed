@@ -4347,6 +4347,7 @@ impl MarkdownElementBuilder {
         element: impl Into<AnyElement>,
     ) {
         self.modify_current_div(|div| div.flex().flex_wrap().items_center());
+        self.div_stack.last_mut().unwrap().line_break_mode = LineBreakMode::FlexWrap;
         let anchor = self.render_source_anchor_with_text_style(source_range, self.text_style());
         self.append_child(
             div()
@@ -4623,13 +4624,20 @@ impl MarkdownElementBuilder {
             code_chips: line.code_chips.into_iter().collect(),
         });
         self.rendered_lines.push(rendered_line.clone());
-        self.append_child(
-            RenderedLineElement {
-                text,
-                line: rendered_line,
-            }
-            .into_any_element(),
-        );
+        let text_child = RenderedLineElement {
+            text,
+            line: rendered_line,
+        }
+        .into_any_element();
+        // In a flex-wrap paragraph the text child is a flex item and must be
+        // allowed to shrink below its intrinsic (max-content) width, otherwise
+        // it overflows the container instead of wrapping.
+        let text_child = if self.uses_flex_line_breaks() {
+            div().min_w_0().child(text_child).into_any_element()
+        } else {
+            text_child
+        };
+        self.append_child(text_child);
     }
 
     fn build(mut self) -> RenderedMarkdown {
@@ -9755,6 +9763,56 @@ mod tests {
         let rendered = draw_markdown(markdown, cx);
 
         assert_eq!(rendered.text_for_range(0..source.len()), "text $x$ text");
+    }
+
+    #[gpui::test]
+    fn test_inline_katex_paragraph_wraps_at_container_width(cx: &mut TestAppContext) {
+        struct TestWindow;
+
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let source = "a longish paragraph with inline math $x$ inside it that should wrap onto multiple lines at a reasonable width";
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                source.into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_embedded_diagrams: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        // The first render schedules the background math render; pump until
+        // it completes, then render again so the inline image path is exercised.
+        let _ = draw_markdown(markdown.clone(), cx);
+        cx.run_until_parked();
+        let rendered = draw_markdown(markdown, cx);
+
+        let text_lines: Vec<_> = rendered
+            .lines
+            .iter()
+            .filter_map(|line| line.visible_bounds.get())
+            .collect();
+        assert!(
+            text_lines.len() >= 2,
+            "expected at least two wrapped text lines, got {text_lines:?}"
+        );
+        for bounds in text_lines {
+            assert!(
+                bounds.size.width <= px(600.),
+                "line {bounds:?} overflows the 600px container"
+            );
+        }
     }
 
     #[gpui::test]
