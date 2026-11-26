@@ -259,62 +259,120 @@ fn handle_rpc_messages_over_child_process_stdio(
 }
 
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+fn resolve_copy_candidate(platform: &crate::RemotePlatform) -> Option<std::path::PathBuf> {
+    let copy = std::env::var("ZED_COPY_REMOTE_SERVER").ok()?;
+    let copy = std::path::PathBuf::from(copy.as_str());
+    // A directory value lets one variable cover several remote platforms:
+    // the first `remote_server-<os>-<arch>` /
+    // `zed-remote-server-<os>-<arch>` file (bare or `.gz`) found inside
+    // it is used, keyed on the platform detected before provisioning.
+    let candidates = if copy.is_dir() {
+        let stem = format!(
+            "remote_server-{}-{}",
+            platform.os.as_str(),
+            platform.arch.as_str()
+        );
+        let bundle_stem = format!(
+            "zed-remote-server-{}-{}",
+            platform.os.as_str(),
+            platform.arch.as_str()
+        );
+        vec![
+            copy.join(format!("{stem}.gz")),
+            copy.join(&stem),
+            copy.join(format!("{bundle_stem}.gz")),
+            copy.join(&bundle_stem),
+        ]
+    } else {
+        vec![copy]
+    };
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+/// Hashes a local artifact the same way the remote binary will exist after
+/// upload: a `.gz` artifact is hashed gunzipped, since the remote extracts it.
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+fn local_artifact_sha256(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    if path.extension().is_some_and(|extension| extension == "gz") {
+        let mut reader = std::io::BufReader::new(file);
+        let mut decoder = flate2::read::GzDecoder::new(&mut reader);
+        std::io::copy(&mut decoder, &mut hasher)?;
+    } else {
+        let mut reader = std::io::BufReader::new(file);
+        std::io::copy(&mut reader, &mut hasher)?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+fn normalize_sha256(output: &str) -> Option<String> {
+    let candidate = output
+        .split_whitespace()
+        .find(|token| token.len() == 64 && token.chars().all(|ch| ch.is_ascii_hexdigit()))?;
+    Some(candidate.to_lowercase())
+}
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
 async fn build_remote_server_from_source(
     platform: &crate::RemotePlatform,
     delegate: &dyn crate::RemoteClientDelegate,
     binary_exists_on_server: bool,
+    remote_binary_sha256: Option<String>,
     cx: &mut AsyncApp,
 ) -> Result<Option<std::path::PathBuf>> {
     use std::env::VarError;
     use util::command::{Command, Stdio, new_command};
 
+    let reuse_requested =
+        std::env::var("ZED_REUSE_REMOTE_SERVER").is_ok_and(|value| value == "true" || value == "1");
+
     // Opt-in bandwidth saver: a usable server binary already on the remote is
-    // reused instead of being re-uploaded on every connection.
-    if binary_exists_on_server
-        && std::env::var("ZED_REUSE_REMOTE_SERVER")
-            .is_ok_and(|value| value == "true" || value == "1")
-    {
+    // reused instead of being re-uploaded on every connection. Dev builds all
+    // report the same version string, so when a local artifact is available and
+    // the remote digest was probed, freshness is verified by comparing content
+    // hashes; a mismatch triggers a re-upload of the local artifact.
+    if binary_exists_on_server && reuse_requested {
+        if let (Some(candidate), Some(remote_binary_sha256)) = (
+            resolve_copy_candidate(platform),
+            remote_binary_sha256.as_deref(),
+        ) {
+            match local_artifact_sha256(&candidate) {
+                Ok(local_sha256) if local_sha256 == remote_binary_sha256 => {
+                    log::info!(
+                        "ZED_REUSE_REMOTE_SERVER is set and the remote server binary matches the local artifact, reusing it"
+                    );
+                    return Ok(None);
+                }
+                Ok(_) => {
+                    log::info!(
+                        "remote server binary differs from the local artifact, re-uploading: {}",
+                        candidate.display()
+                    );
+                    return Ok(Some(candidate));
+                }
+                Err(error) => {
+                    log::warn!(
+                        "could not hash local remote-server artifact {}, reusing the remote binary without a freshness check: {error:#}",
+                        candidate.display()
+                    );
+                }
+            }
+        }
         log::info!(
-            "ZED_REUSE_REMOTE_SERVER is set and a server binary is already usable, reusing it"
+            "ZED_REUSE_REMOTE_SERVER is set and a server binary is already usable, reusing it without a freshness check"
         );
         return Ok(None);
     }
 
-    if let Ok(copy) = std::env::var("ZED_COPY_REMOTE_SERVER") {
-        let copy = std::path::PathBuf::from(copy.as_str());
-        // A directory value lets one variable cover several remote platforms:
-        // the first `remote_server-<os>-<arch>` /
-        // `zed-remote-server-<os>-<arch>` file (bare or `.gz`) found inside
-        // it is used, keyed on the platform detected before provisioning.
-        let candidates = if copy.is_dir() {
-            let stem = format!(
-                "remote_server-{}-{}",
-                platform.os.as_str(),
-                platform.arch.as_str()
-            );
-            let bundle_stem = format!(
-                "zed-remote-server-{}-{}",
-                platform.os.as_str(),
-                platform.arch.as_str()
-            );
-            vec![
-                copy.join(format!("{stem}.gz")),
-                copy.join(&stem),
-                copy.join(format!("{bundle_stem}.gz")),
-                copy.join(&bundle_stem),
-            ]
-        } else {
-            vec![copy.clone()]
-        };
-        match candidates.iter().find(|candidate| candidate.is_file()) {
-            Some(path) => return Ok(Some(path.clone())),
-            None => {
-                log::warn!(
-                    "ZED_COPY_REMOTE_SERVER path does not exist, falling back to ZED_BUILD_REMOTE_SERVER: {}",
-                    copy.display()
-                );
-            }
-        }
+    if let Some(path) = resolve_copy_candidate(platform) {
+        return Ok(Some(path));
+    } else if std::env::var("ZED_COPY_REMOTE_SERVER").is_ok() {
+        log::warn!(
+            "ZED_COPY_REMOTE_SERVER is set but no matching file exists, falling back to ZED_BUILD_REMOTE_SERVER"
+        );
     }
 
     // By default, we make building remote server from source opt-out and we do not force artifact compression
@@ -591,6 +649,57 @@ async fn which(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+    #[test]
+    fn test_normalize_sha256() {
+        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(
+            normalize_sha256(&format!("{digest}  /home/dev/.zed_server/bin\n")),
+            Some(digest.to_string())
+        );
+        assert_eq!(
+            normalize_sha256("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            Some(digest.to_string())
+        );
+        // certutil-style output, uppercase digest on its own line.
+        assert_eq!(
+            normalize_sha256(&format!("SHA256 hash of file:\n{digest}\nDone")),
+            Some(digest.to_string())
+        );
+        // Uppercase is lowercased.
+        assert_eq!(
+            normalize_sha256(&format!("{}  x", digest.to_uppercase())),
+            Some(digest.to_string())
+        );
+        assert_eq!(normalize_sha256("not a digest"), None);
+        assert_eq!(normalize_sha256(""), None);
+        // Too-short hex tokens are rejected.
+        assert_eq!(normalize_sha256("e3b0c442  /path"), None);
+    }
+
+    #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+    #[test]
+    fn test_local_artifact_sha256_matches_gunzipped_content() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"remote server binary bytes";
+
+        let expected = format!("{:x}", Sha256::digest(payload));
+
+        let plain_path = dir.path().join("remote_server-linux-x86_64");
+        std::fs::write(&plain_path, payload).unwrap();
+        assert_eq!(local_artifact_sha256(&plain_path).unwrap(), expected);
+
+        // The remote extracts `.gz` uploads, so the hash must be of the
+        // decompressed content, not of the compressed file.
+        let gz_path = dir.path().join("remote_server-linux-x86_64.gz");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        std::fs::write(&gz_path, encoder.finish().unwrap()).unwrap();
+        assert_eq!(local_artifact_sha256(&gz_path).unwrap(), expected);
+    }
 
     #[test]
     fn test_parse_platform() {

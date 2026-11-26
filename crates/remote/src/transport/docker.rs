@@ -242,10 +242,25 @@ impl DockerExecConnection {
             .await
             .is_ok();
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+        let remote_binary_sha256 = if binary_exists_on_server && !remote_platform.os.is_windows() {
+            self.run_docker_exec(
+                "sha256sum",
+                Some(&remote_dir_for_server),
+                &Default::default(),
+                &[&dst_path.display(self.path_style())],
+            )
+            .await
+            .ok()
+            .and_then(|output| super::normalize_sha256(&output))
+        } else {
+            None
+        };
+        #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
         if let Some(remote_server_path) = super::build_remote_server_from_source(
             &remote_platform,
             delegate.as_ref(),
             binary_exists_on_server,
+            remote_binary_sha256,
             cx,
         )
         .await?

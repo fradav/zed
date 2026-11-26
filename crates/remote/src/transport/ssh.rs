@@ -1015,6 +1015,50 @@ impl SshRemoteConnection {
         Ok(this)
     }
 
+    /// Best-effort sha256 of an existing remote binary, used to detect stale
+    /// reused dev servers. `None` means the digest could not be determined,
+    /// which falls back to unconditional reuse.
+    #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+    async fn remote_binary_sha256(&self, path: &RelPath) -> Option<String> {
+        let path_str = path.display(self.path_style());
+        if self.ssh_platform.os.is_windows() {
+            let output = self
+                .socket
+                .run_command(
+                    self.ssh_shell_kind,
+                    "certutil",
+                    &["-hashfile", path_str.as_ref(), "SHA256"],
+                    true,
+                )
+                .await
+                .ok()?;
+            super::normalize_sha256(&output)
+        } else {
+            let path_arg = path_str.as_ref();
+            let output = match self
+                .socket
+                .run_command(self.ssh_shell_kind, "sha256sum", &[path_arg], true)
+                .await
+            {
+                Ok(output) => Some(output),
+                // macOS remotes ship shasum instead of sha256sum.
+                Err(error) => {
+                    log::debug!("sha256sum failed on remote, trying shasum: {error:#}");
+                    self.socket
+                        .run_command(
+                            self.ssh_shell_kind,
+                            "shasum",
+                            &["-a", "256", path_arg],
+                            true,
+                        )
+                        .await
+                        .ok()
+                }
+            }?;
+            super::normalize_sha256(&output)
+        }
+    }
+
     async fn ensure_server_binary(
         &self,
         delegate: &Arc<dyn RemoteClientDelegate>,
@@ -1051,10 +1095,17 @@ impl SshRemoteConnection {
             .is_ok();
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+        let remote_binary_sha256 = if binary_exists_on_server {
+            self.remote_binary_sha256(&dst_path).await
+        } else {
+            None
+        };
+        #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
         if let Some(remote_server_path) = super::build_remote_server_from_source(
             &self.ssh_platform,
             delegate.as_ref(),
             binary_exists_on_server,
+            remote_binary_sha256,
             cx,
         )
         .await?

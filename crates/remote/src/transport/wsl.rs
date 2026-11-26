@@ -247,10 +247,21 @@ impl WslRemoteConnection {
             .is_ok();
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+        let remote_binary_sha256 = if binary_exists_on_server {
+            let path = dst_path.display(PathStyle::Unix);
+            self.run_wsl_command_with_output("sha256sum", &[&path])
+                .await
+                .ok()
+                .and_then(|output| super::normalize_sha256(&output))
+        } else {
+            None
+        };
+        #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
         if let Some(remote_server_path) = super::build_remote_server_from_source(
             &self.platform,
             delegate.as_ref(),
             binary_exists_on_server,
+            remote_binary_sha256,
             cx,
         )
         .await?
