@@ -1,14 +1,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_skills::{GlobalSkillFileOperation, GlobalSkillPath, Skill, SkillLoadError};
 use anyhow::{Context as _, Result, anyhow};
 use client::{AnyProtoClient, proto};
 use fs::Fs;
-use futures::StreamExt as _;
-use gpui::{App, AppContext as _, AsyncApp, Entity, Task};
+use futures::{Future, StreamExt as _};
+use gpui::{App, AppContext as _, AsyncApp, BackgroundExecutor, Entity, Task};
 use project::Project;
 use util::{ResultExt as _, paths::PathStyle};
+
+/// An out-of-date remote server silently ignores global-skills request types
+/// it doesn't know, so an unanswered request would otherwise hang the caller
+/// forever. These bound the wait and turn the silence into a visible error.
+const GLOBAL_SKILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const GLOBAL_SKILL_FILE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// In a remote project, global skills come from the remote machine's
 /// `~/.agents/skills`, not the local one. The remote server loads and watches
@@ -35,11 +42,20 @@ pub fn load_remote_global_skills(
         }),
         Err(error) => return Task::ready(vec![Err(remote_skills_load_error(error))]),
     };
+    let executor = cx.background_executor().clone();
     cx.background_spawn(async move {
-        let response = match request.await {
-            Ok(response) => response,
-            Err(error) => return vec![Err(remote_skills_load_error(error))],
-        };
+        let response =
+            match remote_request_with_timeout(request, GLOBAL_SKILL_REQUEST_TIMEOUT, &executor)
+                .await
+            {
+                Ok(Some(response)) => response,
+                Ok(None) => {
+                    return vec![Err(remote_skills_load_error(anyhow!(
+                        "timed out; the remote server is probably too old to support global skills"
+                    )))];
+                }
+                Err(error) => return vec![Err(remote_skills_load_error(error))],
+            };
         response
             .results
             .into_iter()
@@ -87,8 +103,19 @@ pub fn create_remote_global_skill(
         body: body.to_string(),
         disable_model_invocation,
     });
+    let executor = cx.background_executor().clone();
     cx.background_spawn(async move {
-        let response = request.await.map_err(without_rpc_request_name)?;
+        let response =
+            match remote_request_with_timeout(request, GLOBAL_SKILL_REQUEST_TIMEOUT, &executor)
+                .await
+            {
+                Ok(Some(response)) => response,
+                Ok(None) => anyhow::bail!(
+                    "timed out waiting for the remote server to create the skill; \
+                     the remote server is probably too old to support global skills"
+                ),
+                Err(error) => return Err(without_rpc_request_name(error)),
+            };
         Ok(PathBuf::from(response.skill_file_path))
     })
 }
@@ -117,9 +144,16 @@ pub fn trash_remote_global_skill(
         project_id: proto::REMOTE_SERVER_PROJECT_ID,
         directory_name,
     });
+    let executor = cx.background_executor().clone();
     cx.background_spawn(async move {
-        request.await.map_err(without_rpc_request_name)?;
-        Ok(())
+        match remote_request_with_timeout(request, GLOBAL_SKILL_REQUEST_TIMEOUT, &executor).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => anyhow::bail!(
+                "timed out waiting for the remote server to trash the skill; \
+                 the remote server is probably too old to support global skills"
+            ),
+            Err(error) => Err(without_rpc_request_name(error)),
+        }
     })
 }
 
@@ -224,14 +258,31 @@ impl GlobalSkillFiles {
                 let client = cx
                     .update(|cx| remote_server_client(project, cx))
                     .log_err()?;
-                let response = client
-                    .request(proto::ResolveGlobalSkillPath {
+                let response = match remote_request_with_timeout(
+                    client.request(proto::ResolveGlobalSkillPath {
                         project_id: proto::REMOTE_SERVER_PROJECT_ID,
                         path: path.to_string_lossy().into_owned(),
                         may_not_exist,
-                    })
-                    .await
-                    .log_err()?;
+                    }),
+                    GLOBAL_SKILL_REQUEST_TIMEOUT,
+                    cx.background_executor(),
+                )
+                .await
+                {
+                    Ok(Some(response)) => response,
+                    Ok(None) => {
+                        log::error!(
+                            "timed out resolving global skill path {} on the remote server; \
+                             an out-of-date remote server silently ignores this request",
+                            path.display()
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        log::error!("failed to resolve global skill path: {error:#}");
+                        return None;
+                    }
+                };
                 Some(GlobalSkillPath {
                     path: PathBuf::from(response.path?),
                     is_skills_dir: response.is_skills_dir,
@@ -320,15 +371,42 @@ impl GlobalSkillFiles {
             }
             Self::Remote(project) => {
                 let client = cx.update(|cx| remote_server_client(project, cx))?;
-                client
-                    .request(proto::ApplyGlobalSkillFileOperation {
+                remote_request_with_timeout(
+                    client.request(proto::ApplyGlobalSkillFileOperation {
                         project_id: proto::REMOTE_SERVER_PROJECT_ID,
                         operation: Some(operation.to_proto()),
-                    })
-                    .await?;
+                    }),
+                    GLOBAL_SKILL_FILE_OPERATION_TIMEOUT,
+                    cx.background_executor(),
+                )
+                .await?
+                .context(
+                    "timed out waiting for the remote server to apply a global skills file \
+                     operation; the remote server is probably too old to support global skills",
+                )?;
                 Ok(())
             }
         }
+    }
+}
+
+/// Awaits a request to the remote server, giving up after `timeout`. Returns
+/// `Ok(None)` when the server never answered, which happens when the remote
+/// server is older than the global-skills protocol: it can't decode the
+/// payload, so no response is ever sent.
+async fn remote_request_with_timeout<F, T>(
+    request: F,
+    timeout: Duration,
+    executor: &BackgroundExecutor,
+) -> Result<Option<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    let timer = executor.timer(timeout);
+    futures::pin_mut!(request, timer);
+    match futures::future::select(request, timer).await {
+        futures::future::Either::Left((result, _)) => result.map(Some),
+        futures::future::Either::Right(((), _)) => Ok(None),
     }
 }
 
