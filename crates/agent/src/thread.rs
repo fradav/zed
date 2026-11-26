@@ -125,6 +125,12 @@ pub enum SandboxStatusRefresh {
 /// the user instead.
 pub const MIN_COMPACTION_CONTEXT_WINDOW: u64 = 80_000;
 
+/// Floor for a compaction request's output budget when the measured (or
+/// synthetically marked) input already saturates the context window and the
+/// model publishes no output default. A zero budget is not an option: servers
+/// answer it with an empty completion, which the compaction loop rejects.
+const MIN_COMPACTION_SUMMARY_OUTPUT_TOKENS: u64 = 1024;
+
 // Using the heuristic that 1 token is about 4 bytes, keep the last 80K bytes of user-message content (~20k tokens).
 const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 
@@ -3786,6 +3792,16 @@ impl Thread {
         } = &error
         {
             self.mark_token_limit_exceeded(*tokens, cx);
+
+            // The zero-delay retry for `PromptTooLarge` exists to let the
+            // agentic loop reach `perform_compaction_if_needed` before
+            // resending. With auto-compaction disabled nothing can shrink the
+            // context, so a retry would only resend the same oversized prompt
+            // until attempts run out; surface the error immediately instead
+            // (upstream's non-retryable treatment).
+            if !self.auto_compaction_enabled(cx) {
+                return Err(anyhow!(error));
+            }
         }
 
         let Some(model) = self.model() else {
@@ -5060,10 +5076,18 @@ impl Thread {
         }
 
         let budget = max_token_count.saturating_sub(input_tokens) / 2;
-        Some(match default_output {
-            Some(default) => budget.min(default),
-            None => budget,
-        })
+        match (budget, default_output) {
+            // A zero completion budget guarantees the empty summary the
+            // compaction loop rejects, and that is exactly what the synthetic
+            // overflow mark (`input_tokens >= max_token_count` from
+            // `mark_token_limit_exceeded`) computes when the model publishes
+            // no output default. Prefer a small non-zero budget: a short
+            // summary still shrinks the context and keeps the loop alive.
+            (0, Some(default)) => Some(default.div_ceil(2)),
+            (0, None) => Some(MIN_COMPACTION_SUMMARY_OUTPUT_TOKENS),
+            (budget, Some(default)) => Some(budget.min(default)),
+            (budget, None) => Some(budget),
+        }
     }
 
     pub fn to_markdown(&self) -> String {
@@ -8364,6 +8388,22 @@ mod tests {
                     .compaction_max_output_tokens(&model_without_default)
                     .expect("clamped budget is still returned");
                 assert!(input + budget <= model_without_default.max_token_count());
+
+                // A synthetic overflow mark (input at the whole window, no
+                // model-provided default) must not produce a zero budget:
+                // servers answer a zero completion budget with an empty
+                // summary, which the compaction loop rejects.
+                thread.request_token_usage.insert(
+                    user_message_id.clone(),
+                    language_model::TokenUsage {
+                        input_tokens: model_without_default.max_token_count(),
+                        ..Default::default()
+                    },
+                );
+                let budget = thread
+                    .compaction_max_output_tokens(&model_without_default)
+                    .expect("budget stays positive when the window is saturated");
+                assert!(budget > 0);
             });
         });
     }
@@ -9392,8 +9432,8 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_overflow_after_compaction_compacts_next_prompt(cx: &mut TestAppContext) {
-        let (thread, fake, model, _events) = start_turn_and_compact(cx).await;
+    async fn test_overflow_after_compaction_compacts_again_immediately(cx: &mut TestAppContext) {
+        let (_thread, fake, model, _events) = start_turn_and_compact(cx).await;
 
         fake.send_last_error(
             &model,
@@ -9406,18 +9446,20 @@ mod tests {
         );
         fake.end_last(&model);
         cx.run_until_parked();
-        assert_eq!(fake.pending_completions(), Vec::new());
 
-        let _events = thread
-            .update(cx, |thread, cx| {
-                thread.send(ClientUserMessageId::new(), vec!["next prompt"], cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-
+        // Unlike upstream, this fork retries a prompt-too-large rejection with
+        // zero delay so the loop re-enters `perform_compaction_if_needed` and
+        // compacts right away, instead of ending the turn and waiting for the
+        // next user prompt.
         assert_eq!(
             last_pending_intent(&fake),
             Some(CompletionIntent::ThreadContextSummarization)
+        );
+
+        finish_compaction(&fake, &model, "second summary", cx);
+        assert_eq!(
+            last_pending_intent(&fake),
+            Some(CompletionIntent::ToolResults)
         );
     }
 
