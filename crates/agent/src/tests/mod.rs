@@ -4802,7 +4802,7 @@ async fn test_oversized_tool_output_replaced_with_notice(cx: &mut TestAppContext
         .unwrap();
     cx.run_until_parked();
 
-    // The tool output exceeds TOOL_OUTPUT_BYTE_BUDGET, so the model should only
+    // The text output exceeds TOOL_OUTPUT_BYTE_BUDGET, so the model should only
     // see a short notice while the full text is preserved in the raw output.
     let huge_output = "x".repeat(50_000);
     let input = json!({ "text": huge_output });
@@ -4831,10 +4831,69 @@ async fn test_oversized_tool_output_replaced_with_notice(cx: &mut TestAppContext
                 is_error: false,
                 content: vec![language_model::LanguageModelToolResultContent::Text(
                     Arc::from(
-                        "[Tool output too large (50000 bytes) to include in the model request; see the transcript for the full output]"
+                        "[Tool text output too large (50000 bytes) to include in the model request; see the transcript for the full output]"
                     )
                 )],
                 output: Some(serde_json::json!(huge_output)),
+            }
+        )]
+    );
+}
+
+#[gpui::test]
+async fn test_oversized_tool_image_is_not_capped(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    fake.update_model("fake", |model| model.supports_images = true);
+    thread.update(cx, |thread, cx| {
+        thread.refresh_model(&model.provider_id, cx)
+    });
+    thread.update(cx, |thread, _cx| thread.add_tool(EchoImageTool));
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Echo a huge image"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // An image whose byte size exceeds TOOL_OUTPUT_BYTE_BUDGET must still reach
+    // the model intact; the cap exists for text, not for images.
+    let huge_source = "a".repeat(50_000);
+    let input = json!({ "source": huge_source.clone() });
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "1".into(),
+            name: EchoImageTool::NAME.into(),
+            raw_input: input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let completion = fake.pending_completions().pop().unwrap();
+    let message = completion.messages.last().unwrap();
+    assert_eq!(
+        message.content,
+        vec![language_model::MessageContent::ToolResult(
+            LanguageModelToolResult {
+                tool_use_id: "1".into(),
+                tool_name: EchoImageTool::NAME.into(),
+                is_error: false,
+                content: vec![language_model::LanguageModelToolResultContent::Image(
+                    language_model::LanguageModelImage {
+                        source: huge_source.clone().into()
+                    }
+                )],
+                output: Some(serde_json::json!({ "source": huge_source })),
             }
         )]
     );
@@ -5402,6 +5461,7 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
                         "name": "Test Profile",
                         "tools": {
                             EchoTool::NAME: true,
+                            EchoImageTool::NAME: true,
                             DelayTool::NAME: true,
                             WordListTool::NAME: true,
                             ToolRequiringPermission::NAME: true,

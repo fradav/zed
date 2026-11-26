@@ -224,6 +224,54 @@ impl AgentTool for EchoTool {
     }
 }
 
+/// A tool that echoes its input back as an image, to exercise the image parts
+/// of tool results.
+#[derive(JsonSchema, Serialize, Deserialize)]
+pub struct EchoImageToolInput {
+    /// The base64 source to echo as an image.
+    pub source: String,
+}
+
+pub struct EchoImageTool;
+
+impl AgentTool for EchoImageTool {
+    type Input = EchoImageToolInput;
+    type Output = language_model::LanguageModelImage;
+
+    const NAME: &'static str = "echo_image";
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Other
+    }
+
+    fn initial_title(
+        &self,
+        _input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        "Echo Image".into()
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        _event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        cx.spawn(async move |_cx| {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| language_model::LanguageModelImage {
+                    source: e.to_string().into(),
+                })?;
+            Ok(language_model::LanguageModelImage {
+                source: input.source.into(),
+            })
+        })
+    }
+}
+
 /// A tool that waits for a specified delay
 #[derive(JsonSchema, Serialize, Deserialize)]
 pub struct DelayToolInput {
