@@ -4208,6 +4208,9 @@ impl MarkdownElementBuilder {
     }
 
     fn push_image_child(&mut self, child: impl IntoElement) {
+        // Set the flex-wrap mode before flushing pending text, so the text
+        // child is wrapped in a shrinkable min_w_0 div.
+        self.div_stack.last_mut().unwrap().line_break_mode = LineBreakMode::FlexWrap;
         let text_align = self.text_style().text_align;
         let table_cell_alignment = self
             .table
@@ -4237,7 +4240,6 @@ impl MarkdownElementBuilder {
                 }
             }
         });
-        self.div_stack.last_mut().unwrap().line_break_mode = LineBreakMode::FlexWrap;
         self.append_child(child.into_any_element());
     }
 
@@ -4346,8 +4348,10 @@ impl MarkdownElementBuilder {
         source_range: Range<usize>,
         element: impl Into<AnyElement>,
     ) {
-        self.modify_current_div(|div| div.flex().flex_wrap().items_center());
+        // Set the flex-wrap mode before flushing pending text, so the text
+        // child is wrapped in a shrinkable min_w_0 div.
         self.div_stack.last_mut().unwrap().line_break_mode = LineBreakMode::FlexWrap;
+        self.modify_current_div(|div| div.flex().flex_wrap().items_center());
         let anchor = self.render_source_anchor_with_text_style(source_range, self.text_style());
         self.append_child(
             div()
@@ -9778,7 +9782,7 @@ mod tests {
         ensure_theme_initialized(cx);
 
         let (_, cx) = cx.add_window_view(|_, _| TestWindow);
-        let source = "a longish paragraph with inline math $x$ inside it that should wrap onto multiple lines at a reasonable width";
+        let source = "Four times the routers, two very different sizes. 8x8 already takes thirteen seconds per device and finishes only because thirteen seconds is survivable. The step from 8x8 to 16x16 m $10^{10}$ calls per device, days at pythons ~50k calls/s, and the staircase keeps getting longer than a workday";
         let markdown = cx.new(|cx| {
             Markdown::new_with_options(
                 source.into(),
